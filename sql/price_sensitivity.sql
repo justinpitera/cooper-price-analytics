@@ -1,3 +1,4 @@
+-- Loaded into metabase
 WITH eligible_prices AS (
     -- Select the same services and prices as your original analysis.
     SELECT

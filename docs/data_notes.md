@@ -1,65 +1,46 @@
 # Data notes
 
-[Back to the setup guide](../README.md)
+[Project overview and setup](../README.md)
 
-## What's in the files?
-
-Each CSV starts with two rows describing the hospital, then a row of column names. Each remaining row describes a service, with separate price columns for each insurance plan. The loader turns those many columns into tables that are easier to query.
-
-These numbers describe the saved copies; future downloads may differ:
+## Source files
 
 | | Cooper | Cape Regional |
 | --- | ---: | ---: |
 | File update date | June 23, 2026 | July 1, 2026 |
-| Service rows | 25,654 | 13,702 |
-| Insurance plan combinations | 42 | 37 |
-| Service/plan rows with a dollar price | 27.43% | 27.43% |
-| Repeated code/attribute combinations after the first occurrence | 1,143 | 2,439 |
+| Service records | 25,654 | 13,702 |
+| Payer/plan combinations | 42 | 37 |
+| Service/plan records with a dollar price | 27.43% | 27.43% |
 
-There were no malformed or fully duplicated service rows. Repeated code combinations can still have different prices. The full [saved report](profile_summary.json) includes file fingerprints (SHA-256 hashes) so we can tell whether a download is the same version. The original download dates weren't recorded.
+These figures describe the saved files. New downloads may differ. The [saved profile](profile_summary.json) contains file hashes and detailed checks. No malformed or fully duplicated service rows were found; repeated procedure codes are present.
 
-## The five tables
+## Tables
 
-All tables are in `analytics`, a named group of tables inside the `cooper` database.
+All tables are in the `analytics` schema of the `cooper` database.
 
-| Table | What one row means |
+| Table | One row represents |
 | --- | --- |
-| `source_file` | One imported version of a CSV |
-| `service` | One service row from that file |
-| `service_code` | One of the service's three code slots, including empty slots |
-| `payer_plan` | One insurance company (“payer”) and plan in that file |
-| `service_rate` | One service and insurance plan, including entries with blank prices |
+| `source_file` | An imported CSV version |
+| `service` | A service record from that CSV |
+| `service_code` | One of a service's three code slots |
+| `payer_plan` | An insurer and plan within a source file |
+| `service_rate` | A service/plan combination, including blank prices |
 
-Join services using **both `source_file_id` and `csv_record`**. A procedure code alone isn't unique. `csv_record` counts CSV records, starting at 4 for the first service; a record may span several text lines.
+Join services on **`source_file_id` and `csv_record`**. A CPT code alone is not unique. Join plans on the source file and plan ID. The analysis uses code slot 1 to avoid counting each price more than once.
 
-Join plans using both `source_file_id` and the plan ID. When joining codes, select a slot (the first query uses slot 1) so each service's three code slots don't triple its prices.
+Blank numbers become `NULL`; zero stays zero. Codes remain text to preserve leading zeroes. Reported counts of `1 through 10` remain ranges. Changed files are stored as separate snapshots.
 
-Money uses exact decimal values. Blank numbers become SQL `NULL`; zero stays zero. Codes stay text so leading zeroes survive. A reported count of `1 through 10` stays a range, not a guessed number. These counts describe historical payment summaries, not total service volume.
+## Price comparisons
 
-The loader keeps the original cells and checks row counts and field totals against a fresh scan before saving each file. Reloading an identical file checks the existing import. A changed download is saved as a new snapshot, so keep `source_file_id` in your analysis to avoid mixing versions.
+[price_spread.sql](../sql/price_spread.sql) selects Cooper outpatient facility records with a primary CPT code. It excludes drug codes and units, then keeps positive dollar prices marked `fee schedule` without an accompanying percentage or formula. Each service needs at least two eligible plan prices.
 
-## What the first query does
+**Spread** is the highest price minus the lowest. **Ratio** is the highest divided by the lowest. Plan count and insurer count are separate: several plans may belong to one insurer.
 
-[price_spread.sql](../sql/price_spread.sql) selects Cooper outpatient facility services with a primary CPT code. It excludes drug codes/units, uses positive dollar prices marked `fee schedule`, and excludes entries also expressed as percentages or formulas.
+[price_sensitivity.sql](../sql/price_sensitivity.sql) excludes rates with “lesser of” payer notes. It compares median spreads and ratios using only service records with at least two eligible prices in both versions. This keeps changes in the group of services from driving the comparison.
 
-For each source service row with at least two eligible plans, it returns:
+The sensitivity and detail queries use `source_file_id = 1`. That ID must refer to the intended Cooper snapshot.
 
-| Result | Meaning |
-| --- | --- |
-| `minimum_price`, `maximum_price` | Lowest and highest eligible plan prices |
-| `price_spread` | Highest minus lowest, in dollars |
-| `price_ratio` | Highest divided by lowest |
-| `plan_count`, `payer_count` | Number of plans and distinct insurance companies |
+## Interpretation
 
-Two plans can belong to the same insurer. A comparison between insurers needs at least two distinct payers.
+Payment notes, modifiers, bundles, and units can affect comparability. Excluding one type of payment note does not resolve every difference. Blank dollar prices may instead have percentage or formula terms.
 
-**This is an exploration query.** It doesn't yet resolve repeated service definitions or review notes, modifiers, bundles, and units. Those details can make apparently similar prices incompatible. Historical median payment amounts are separate from negotiated prices and aren't used in this query.
-
-## Finish the analysis in small steps
-
-1. Read one query result and trace it back to the original CSV using its source file and record number.
-2. Review notes, modifiers, and payment terms. Check repeated service definitions; flag unresolved rows and exclude them from final rankings. Inspect five large spreads and five ordinary examples.
-3. Report coverage: how many services pass the filters, how many have two comparable plan prices, and how many each exclusion removes. A blank dollar price may have a percentage or formula instead; 27.43% is dollar availability, not an error rate.
-4. Make one Metabase chart and a table of reviewed services. Write three findings supported by the query results, including which file versions you used and how much data you excluded.
-
-Comparing hospitals and comparing negotiated prices with cash/gross charges can wait. Cross-hospital comparisons need verified one-to-one service matches and equivalent plans/payment terms. These files alone don't show patient savings, hospital profit, care quality, or which hospital is generally cheaper.
+Published negotiated prices are not patient bills or historical payment amounts. This analysis does not measure patient savings, hospital profit, care quality, or differences between hospitals.

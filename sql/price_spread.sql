@@ -26,7 +26,7 @@ WITH
             AND plans.id = rates.payer_plan_id
         WHERE
             -- ->> reads the hospital name from the file's JSON metadata.
-            files.metadata - > > 'hospital_name' = 'Cooper University Hospital'
+            files.metadata ->> 'hospital_name' = 'Cooper University Hospital'
             -- Include outpatient facility services with a primary CPT code.
             AND services.setting = 'outpatient'
             AND services.billing_class = 'facility'
