@@ -7,6 +7,6 @@
         "**/Thumbs.db": true,
         "uv.lock": true,
         ".venv": true,
-        "**/__pycache__": true
+        "**/__pycache__": true,
     }
 }

@@ -1,4 +1,9 @@
-"""Audit every CSV record in the observed wide layout; not a CMS compliance validator."""
+"""Scan the hospital CSVs and summarize their structure and data quality.
+
+This checks every service row for blanks, numbers, and repeated codes.
+It helps us understand the files; it doesn't verify that the published prices
+are correct. The loader also uses this report to check its imports.
+"""
 
 import argparse
 import csv
@@ -20,11 +25,13 @@ SOURCES = {
 SUMMARY_FIELDS = {'median_amount', '10th_percentile', '90th_percentile', 'count', 'additional_payer_notes'}
 NUMERIC_FIELDS = {'gross', 'discounted_cash', 'min', 'max', 'negotiated_dollar', 'negotiated_percentage', 'median_amount', '10th_percentile', '90th_percentile', 'count', 'drug_unit_of_measurement'}
 NUMBER = re.compile(r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)')
+# Some hospital notes are longer than Python's default CSV field limit.
 csv.field_size_limit(10_000_000)
 
 
 def payer_field(header: str) -> tuple[str, str, str] | None:
-    """Summary and notes headers have a different shape from charge headers."""
+    """Read insurer, plan, and field from headers such as standard_charge|Aetna|HMO|negotiated_dollar."""
+    # Prices start with standard_charge; summary fields and notes don't.
     parts = header.split('|')
     if len(parts) == 4 and parts[0] == 'standard_charge':
         return parts[1], parts[2], parts[3]
@@ -34,12 +41,14 @@ def payer_field(header: str) -> tuple[str, str, str] | None:
 
 
 def detect_layout(headers: list[str]) -> str:
+    """Wide files put plans in columns; tall files put plan names in rows."""
     tall = {'payer_name', 'plan_name'}.issubset(headers)
     wide = any(payer_field(h) for h in headers)
     return 'mixed' if tall and wide else 'tall' if tall else 'wide' if wide else 'unknown'
 
 
 def number(value: str) -> Decimal | None:
+    """Accept plain decimal numbers. Don't silently repair unexpected source text."""
     if not NUMBER.fullmatch(value):
         return None
     try:
@@ -50,6 +59,7 @@ def number(value: str) -> Decimal | None:
 
 
 def normalized_date(raw: str) -> str:
+    """Both hospitals' date formats become YYYY-MM-DD in the report."""
     for fmt in ('%Y-%m-%d', '%m/%d/%Y'):
         try:
             return datetime.strptime(raw, fmt).date().isoformat()
@@ -59,6 +69,7 @@ def normalized_date(raw: str) -> str:
 
 
 def new_stats(numeric: bool, count_field: bool = False) -> dict:
+    """Start the counters for one column; numeric columns need extra checks."""
     stats = {'blank': 0, 'nonblank': 0}
     if numeric:
         stats.update(valid_numeric=0, zero=0, positive=0, negative=0,
@@ -69,11 +80,13 @@ def new_stats(numeric: bool, count_field: bool = False) -> dict:
 
 
 def observe(stats: dict, raw: str) -> Decimal | None:
+    """Add one cell to its column's statistics and return its number, if any."""
     value = raw.strip()
     if not value:
         stats['blank'] += 1
         return None
     stats['nonblank'] += 1
+    # This is an intentionally hidden exact count, not a missing or invalid value.
     if 'suppressed_1_through_10' in stats and value == '1 through 10':
         stats['suppressed_1_through_10'] += 1
         return None
@@ -98,11 +111,12 @@ def observe(stats: dict, raw: str) -> Decimal | None:
 
 
 def fingerprint(values: list[str]) -> bytes:
+    """Keep a small hash for duplicate detection instead of storing each whole row."""
     return hashlib.sha256(json.dumps(values, ensure_ascii=False).encode()).digest()
 
 
-def read_header(rows, path: Path) -> tuple[dict[str, str], list[str]]:
-    """Read and validate the shared metadata and wide charge header."""
+def read_header(rows, path: Path) -> tuple[dict[str, str], list[str], int]:
+    """Read hospital metadata from records 1–2 and column names from record 3."""
     try:
         metadata_headers, metadata_values, headers = [next(rows) for _ in range(3)]
     except StopIteration as exc:
@@ -123,11 +137,13 @@ def read_header(rows, path: Path) -> tuple[dict[str, str], list[str]]:
     slots = [h for h in headers if re.fullmatch(r'code\|\d+', h)]
     if any(f'{h}|type' not in headers for h in slots):
         raise ValueError(f'{path}: code slot lacks a type column')
-    # Retain the width separately for the profiler's existing audit output.
+    # Cape Regional pads its metadata with empty columns; count those separately.
     return metadata, headers, len(metadata_headers) - len(named_metadata)
 
 
 def profile(path: Path) -> dict:
+    """Scan one complete file and return a report that can be saved as JSON."""
+    # This fingerprint lets us distinguish an updated download from the old file.
     with path.open('rb') as file:
         digest = hashlib.file_digest(file, 'sha256').hexdigest()
     result = {'file': path.name, 'source_url': SOURCES.get(path.name),
@@ -139,6 +155,7 @@ def profile(path: Path) -> dict:
         result.update(metadata=metadata, last_updated_on=normalized_date(metadata['last_updated_on']),
                       metadata_blank_headers=blank_metadata_headers,
                       columns=len(headers), layout='wide')
+        # Each plan has its own columns; group matching fields for the totals.
         specs = [payer_field(h) for h in headers]
         fields = [spec[2] if spec else h.split('|')[-1] for h, spec in zip(headers, specs)]
         stats = [new_stats(field in NUMERIC_FIELDS, field == 'count') for field in fields]
@@ -148,12 +165,16 @@ def profile(path: Path) -> dict:
         methodologies = Counter()
         index = {h: i for i, h in enumerate(headers)}
         key_fields = [h for h in headers if h.startswith('code|')] + ['setting', 'billing_class', 'modifiers', 'drug_unit_of_measurement', 'drug_type_of_measurement']
+        # A repeated code/attribute combination isn't necessarily a duplicate row.
+        # Track both, because different services can share the same codes.
         seen_rows, seen_keys = set(), set()
         quality = Counter(total_records=0, valid_width_records=0, malformed_records=0,
                           exact_duplicate_records=0, repeated_candidate_key_records=0,
                           incomplete_code_pairs=0, records_without_codes=0,
                           records_with_at_least_two_positive_dollars=0)
         malformed_examples = []
+        # CSV records may contain newlines inside quoted descriptions or notes.
+        # Count parsed records, not physical text lines.
         for record, row in enumerate(rows, start=4):
             quality['total_records'] += 1
             if len(row) != len(headers):
@@ -185,6 +206,7 @@ def profile(path: Path) -> dict:
         result.update(quality=dict(quality), malformed_examples=malformed_examples,
                       candidate_key_fields=key_fields, categories={h: dict(c) for h, c in categories.items()},
                       methodologies=dict(methodologies), column_profiles=dict(zip(headers, stats)))
+        # Combine per-column counts into totals such as all negotiated dollars.
         groups = {}
         for field, stat in zip(fields, stats):
             group = groups.setdefault(field, Counter())
